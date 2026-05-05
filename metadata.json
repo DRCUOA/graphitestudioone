@@ -1,0 +1,6 @@
+{
+  "name": "Graphite Studio",
+  "description": "Professional drawing assistant for photo-realistic pencil art, featuring tonal mapping, grid overlays, and value analysis tools.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": []
+}
