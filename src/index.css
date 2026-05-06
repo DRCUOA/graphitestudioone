@@ -1,1 +1,127 @@
 @import "tailwindcss";
+
+/* -------------------------------------------------------------------------- */
+/* Theme: smooth color transitions when toggling light/dark                    */
+/* -------------------------------------------------------------------------- */
+html {
+  color-scheme: dark;
+  background-color: var(--color-zinc-950);
+  color: var(--color-zinc-300);
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+}
+
+/* Apply transitions to common themed properties so the swap feels smooth.
+   We exclude `transform` and `opacity` (used by motion/react animations).   */
+html,
+body,
+[class*="bg-zinc"],
+[class*="text-zinc"],
+[class*="border-zinc"],
+.dot-grid-bg {
+  transition:
+    background-color 200ms ease,
+    color 200ms ease,
+    border-color 200ms ease,
+    background-image 200ms ease;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Light theme: invert the zinc scale so existing utilities flip automatically.
+   Mapping is hand-tuned (rather than a strict mathematical inversion) so that
+   muted-text shades remain legible on light backgrounds.                     */
+/* -------------------------------------------------------------------------- */
+html[data-theme="light"] {
+  --color-zinc-50:  oklch(0.18  0.006 286);
+  --color-zinc-100: oklch(0.24  0.006 286);
+  --color-zinc-200: oklch(0.30  0.006 286);
+  --color-zinc-300: oklch(0.38  0.013 286);
+  --color-zinc-400: oklch(0.48  0.015 286);
+  --color-zinc-500: oklch(0.55  0.016 286);
+  --color-zinc-600: oklch(0.66  0.015 286);
+  --color-zinc-700: oklch(0.82  0.008 286);
+  --color-zinc-800: oklch(0.90  0.005 286);
+  --color-zinc-900: oklch(0.95  0.003 286);
+  --color-zinc-950: oklch(0.985 0     0);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Workspace dot-grid background — themed.                                     */
+/* -------------------------------------------------------------------------- */
+.dot-grid-bg {
+  background-image: radial-gradient(#1a1a1a 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+html[data-theme="light"] .dot-grid-bg {
+  background-image: radial-gradient(rgba(0, 0, 0, 0.18) 1px, transparent 1px);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Workspace canvas drop-shadow looks too heavy on light. Soften it.           */
+/* -------------------------------------------------------------------------- */
+html[data-theme="light"] .canvas-shadow {
+  box-shadow: 0 20px 40px -8px rgba(0, 0, 0, 0.18);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Decorative watermark logo bleeding off the top-left of the viewport.
+   Behaviour:
+     - Position: fixed so it never affects layout.
+     - Pointer-events: none so it never intercepts clicks; sidebar/toolbar
+       controls beneath the logo remain fully interactive.
+     - High z-index so the watermark overlays the entire UI; integration
+       happens through `mix-blend-mode`, not stacking — sidebar contents
+       remain fully readable.
+     - In DARK mode: invert the image so white paper becomes black; then
+       `mix-blend-mode: screen` makes the (now-black) paper disappear and
+       the (now-white) pencil strokes glow softly over the dark UI.
+     - In LIGHT mode: keep the image as-is and use `mix-blend-mode: multiply`
+       so the white paper becomes invisible and the dark pencil strokes
+       darken the underlying UI as a subtle ink wash.
+     - A radial mask fades the right and bottom edges so the watermark
+       dissolves into the rest of the UI rather than ending in a hard rect.
+   ---------------------------------------------------------------------------*/
+.app-watermark {
+  position: fixed;
+  top: -180px;
+  left: -200px;
+  width: 760px;
+  height: auto;
+  pointer-events: none;
+  user-select: none;
+  z-index: 40;
+  opacity: 0.85;
+  filter: invert(1) brightness(1.25) contrast(1.15);
+  mix-blend-mode: screen;
+  -webkit-mask-image: radial-gradient(
+    ellipse 65% 65% at 32% 32%,
+    rgba(0, 0, 0, 1) 30%,
+    rgba(0, 0, 0, 0.85) 50%,
+    rgba(0, 0, 0, 0) 95%
+  );
+          mask-image: radial-gradient(
+    ellipse 65% 65% at 32% 32%,
+    rgba(0, 0, 0, 1) 30%,
+    rgba(0, 0, 0, 0.85) 50%,
+    rgba(0, 0, 0, 0) 95%
+  );
+  transition: opacity 200ms ease, filter 200ms ease;
+}
+
+html[data-theme="light"] .app-watermark {
+  filter: contrast(1.05);
+  opacity: 0.55;
+  mix-blend-mode: multiply;
+}
+
+/* On very narrow viewports, scale the watermark down so it doesn't dominate. */
+@media (max-width: 900px) {
+  .app-watermark {
+    width: 480px;
+    top: -120px;
+    left: -140px;
+  }
+}
