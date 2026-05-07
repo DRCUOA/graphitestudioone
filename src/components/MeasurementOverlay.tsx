@@ -10,6 +10,8 @@ import {
   formatMeasurement,
   pxToUnits,
 } from '../lib/calibration';
+import { computeLineMetrics } from '../lib/geometry';
+import { LineMetricsHUD } from './LineMetricsHUD';
 
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
@@ -62,6 +64,8 @@ interface Props {
     point: CalibrationPoint,
   ) => void;
   onMeasurementPointDragEnd: () => void;
+  /** Optional snap function — see FreeLineOverlay for the contract. */
+  snap?: ((x: number, y: number) => { x: number; y: number } | null) | null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -92,10 +96,22 @@ export const MeasurementOverlay: React.FC<Props> = ({
   onHover,
   onMeasurementPointDrag,
   onMeasurementPointDragEnd,
+  snap,
 }) => {
   const svgRef = useRef<SVGSVGElement>(null);
   const [dragging, setDragging] = useState<{ id: string; which: 'A' | 'B' } | null>(null);
   const isPlacing = mode === 'placingA' || mode === 'placingB';
+
+  // Apply snap to every captured point so click placements, hovers and
+  // marker drags all benefit from edge magnetism.
+  const applySnap = useCallback(
+    (raw: CalibrationPoint): CalibrationPoint => {
+      if (!snap) return raw;
+      const hit = snap(raw.x, raw.y);
+      return hit ? { x: hit.x, y: hit.y } : raw;
+    },
+    [snap],
+  );
 
   /* ------------------------------------------------------------------ */
   /* Pointer handlers — placement clicks                                */
@@ -105,31 +121,31 @@ export const MeasurementOverlay: React.FC<Props> = ({
       if (!isPlacing) return;
       // Don't hijack clicks on a marker handle.
       if ((e.target as Element).getAttribute('data-handle')) return;
-      const pt = eventToImagePoint(
+      const raw = eventToImagePoint(
         e.clientX,
         e.clientY,
         svgRef.current,
         imageWidth,
         imageHeight,
       );
-      if (pt) onCanvasClick(pt);
+      if (raw) onCanvasClick(applySnap(raw));
     },
-    [isPlacing, imageWidth, imageHeight, onCanvasClick],
+    [isPlacing, imageWidth, imageHeight, onCanvasClick, applySnap],
   );
 
   const handlePointerMove = useCallback(
     (e: React.PointerEvent<SVGSVGElement>) => {
       if (!isPlacing) return;
-      const pt = eventToImagePoint(
+      const raw = eventToImagePoint(
         e.clientX,
         e.clientY,
         svgRef.current,
         imageWidth,
         imageHeight,
       );
-      if (pt) onHover(pt);
+      if (raw) onHover(applySnap(raw));
     },
-    [isPlacing, imageWidth, imageHeight, onHover],
+    [isPlacing, imageWidth, imageHeight, onHover, applySnap],
   );
 
   const handlePointerLeave = useCallback(() => {
@@ -143,14 +159,14 @@ export const MeasurementOverlay: React.FC<Props> = ({
   useEffect(() => {
     if (!dragging) return;
     const onMove = (e: PointerEvent) => {
-      const pt = eventToImagePoint(
+      const raw = eventToImagePoint(
         e.clientX,
         e.clientY,
         svgRef.current,
         imageWidth,
         imageHeight,
       );
-      if (pt) onMeasurementPointDrag(dragging.id, dragging.which, pt);
+      if (raw) onMeasurementPointDrag(dragging.id, dragging.which, applySnap(raw));
     };
     const onUp = () => {
       setDragging(null);
@@ -168,6 +184,7 @@ export const MeasurementOverlay: React.FC<Props> = ({
     imageHeight,
     onMeasurementPointDrag,
     onMeasurementPointDragEnd,
+    applySnap,
   ]);
 
   const startMarkerDrag = (
@@ -203,10 +220,8 @@ export const MeasurementOverlay: React.FC<Props> = ({
     draftFrom = draftA;
     draftTo = draftB;
   }
-  const draftPx = draftFrom && draftTo ? distance(draftFrom, draftTo) : 0;
-  const draftReal = draftFrom && draftTo
-    ? formatLiveDistance(draftPx, calibration)
-    : '';
+  // (Live distance/angle/components for the in-flight draft are now
+  // rendered by <LineMetricsHUD>, not by the simple midpoint label.)
 
   return (
     <svg
@@ -248,18 +263,32 @@ export const MeasurementOverlay: React.FC<Props> = ({
       })}
 
       {/* --------------- In-progress draft --------------- */}
+      {/* Line + endpoints with NO label — the rich metrics HUD takes over
+          while the user is positioning point B so they can see length,
+          angle, and horizontal/vertical components live. */}
       {draftFrom && draftTo && (
-        <MarkerLine
-          from={draftFrom}
-          to={draftTo}
-          label={draftReal}
-          color={COLOR}
-          dashed
-          markerRadius={markerRadius}
-          strokeWidth={strokeWidth}
-          labelFontSize={labelFontSize}
-          interactive={false}
-        />
+        <>
+          <MarkerLine
+            from={draftFrom}
+            to={draftTo}
+            label=""
+            color={COLOR}
+            dashed
+            markerRadius={markerRadius}
+            strokeWidth={strokeWidth}
+            labelFontSize={labelFontSize}
+            interactive={false}
+          />
+          <LineMetricsHUD
+            from={draftFrom}
+            to={draftTo}
+            metrics={computeLineMetrics(draftFrom, draftTo, calibration)}
+            imageWidth={imageWidth}
+            imageHeight={imageHeight}
+            color={COLOR}
+            fontSize={labelFontSize}
+          />
+        </>
       )}
 
       {/* Single A point during placingB before user moves the cursor. */}

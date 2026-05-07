@@ -1,9 +1,12 @@
 import React, { useCallback, useRef } from 'react';
 import {
+  Calibration,
   CalibrationPoint,
   DrawnLine,
   LineMode,
 } from '../types';
+import { computeLineMetrics } from '../lib/geometry';
+import { LineMetricsHUD } from './LineMetricsHUD';
 
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
@@ -36,6 +39,12 @@ interface Props {
   /** Provisional first-point being placed in continuous-draw mode. */
   draftA: CalibrationPoint | null;
   hoverPoint: CalibrationPoint | null;
+  /** Active calibration — used to render the in-flight metrics HUD in
+   *  real-world units. Pass null when no calibration exists; the HUD
+   *  will fall back to pixel readings. */
+  calibration: Calibration | null;
+  /** Optional snap function — see FreeLineOverlay for the contract. */
+  snap?: ((x: number, y: number) => { x: number; y: number } | null) | null;
 
   onCanvasClick: (point: CalibrationPoint) => void;
   onHover: (point: CalibrationPoint | null) => void;
@@ -61,28 +70,42 @@ export const LineOverlay: React.FC<Props> = ({
   mode,
   draftA,
   hoverPoint,
+  calibration,
+  snap,
   onCanvasClick,
   onHover,
 }) => {
   const svgRef = useRef<SVGSVGElement>(null);
   const isPlacing = mode === 'placingA' || mode === 'placingB';
 
+  // Apply snap if available; the result is what gets recorded as the
+  // line endpoint, so the rubber-band hover and the committed click
+  // both naturally land on detected outlines.
+  const applySnap = useCallback(
+    (raw: CalibrationPoint): CalibrationPoint => {
+      if (!snap) return raw;
+      const hit = snap(raw.x, raw.y);
+      return hit ? { x: hit.x, y: hit.y } : raw;
+    },
+    [snap],
+  );
+
   const handlePointerDown = useCallback(
     (e: React.PointerEvent<SVGSVGElement>) => {
       if (!isPlacing) return;
-      const pt = eventToImagePoint(e, svgRef.current, imageWidth, imageHeight);
-      if (pt) onCanvasClick(pt);
+      const raw = eventToImagePoint(e, svgRef.current, imageWidth, imageHeight);
+      if (raw) onCanvasClick(applySnap(raw));
     },
-    [isPlacing, imageWidth, imageHeight, onCanvasClick],
+    [isPlacing, imageWidth, imageHeight, onCanvasClick, applySnap],
   );
 
   const handlePointerMove = useCallback(
     (e: React.PointerEvent<SVGSVGElement>) => {
       if (!isPlacing) return;
-      const pt = eventToImagePoint(e, svgRef.current, imageWidth, imageHeight);
-      if (pt) onHover(pt);
+      const raw = eventToImagePoint(e, svgRef.current, imageWidth, imageHeight);
+      if (raw) onHover(applySnap(raw));
     },
-    [isPlacing, imageWidth, imageHeight, onHover],
+    [isPlacing, imageWidth, imageHeight, onHover, applySnap],
   );
 
   const handlePointerLeave = useCallback(() => {
@@ -95,6 +118,9 @@ export const LineOverlay: React.FC<Props> = ({
   const haloWidth = strokeWidth * 2.4;
   // Distinct hue from cyan (calibration) and amber (measurements).
   const COLOR = '#a78bfa'; // violet-400
+  // HUD font size — same scaling rule the other overlays use so the
+  // badge looks consistent across the app.
+  const hudFontSize = Math.max(10, Math.min(imageWidth, imageHeight) * 0.014);
 
   // Live rubber-band preview between the first click and the cursor.
   const draftFrom = mode === 'placingB' ? draftA : null;
@@ -148,6 +174,8 @@ export const LineOverlay: React.FC<Props> = ({
       })}
 
       {/* --------------- In-flight rubber band --------------- */}
+      {/* Rubber-band line PLUS a live metrics HUD (length, angle, Δx, Δy)
+          so the user gets directional feedback while positioning point B. */}
       {draftFrom && draftTo && (
         <g>
           <line
@@ -169,6 +197,15 @@ export const LineOverlay: React.FC<Props> = ({
             strokeWidth={strokeWidth}
             strokeDasharray={`${strokeWidth * 4} ${strokeWidth * 3}`}
             strokeLinecap="round"
+          />
+          <LineMetricsHUD
+            from={draftFrom}
+            to={draftTo}
+            metrics={computeLineMetrics(draftFrom, draftTo, calibration)}
+            imageWidth={imageWidth}
+            imageHeight={imageHeight}
+            color={COLOR}
+            fontSize={hudFontSize}
           />
         </g>
       )}

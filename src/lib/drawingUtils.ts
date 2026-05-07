@@ -21,7 +21,18 @@ export const applyAssistantFilters = (
   const imageData = ctx.getImageData(0, 0, width, height);
   const data = imageData.data;
 
-  const { grayscale, posterize, posterizeLevels, highlightGrade, contrast, brightness, edges, invert, notan, notanThreshold } = settings;
+  const { grayscale, posterize, posterizeLevels, highlightGrades, contrast, brightness, edges, invert, notan, notanThreshold } = settings;
+
+  // Pre-compute the union of luminance bins for the selected grades.
+  // Multiple grades may form non-contiguous bands (e.g. user picks 9B
+  // for deep shadows and HB for mid-tones), so we keep them as a list
+  // of [min, max] pairs and test each pixel against every range.
+  // Empty list = highlighting disabled, which keeps the inner loop
+  // branch-free for the common no-highlight case.
+  const highlightRanges: Array<[number, number]> = (highlightGrades && highlightGrades.length > 0)
+    ? highlightGrades.map((g) => getLuminanceRange(g))
+    : [];
+  const hasHighlight = highlightRanges.length > 0;
 
   // Initial pass for Brightness, Contrast, Grayscale, Invert, Notan
   const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
@@ -45,7 +56,7 @@ export const applyAssistantFilters = (
       avg = avg > notanThreshold ? 255 : 0;
     }
 
-    if (grayscale || posterize || highlightGrade !== 'NONE' || edges || notan) {
+    if (grayscale || posterize || hasHighlight || edges || notan) {
       r = g = b = avg;
     }
 
@@ -103,9 +114,19 @@ export const applyAssistantFilters = (
       avg = Math.round(avg / step) * step;
     }
 
-    if (highlightGrade !== 'NONE' && !edges) {
-      const [min, max] = getLuminanceRange(highlightGrade);
-      if (avg >= min && avg <= max) {
+    if (hasHighlight && !edges) {
+      // Pixel lights up cyan if its luminance falls inside ANY selected
+      // pencil-grade band — that's how cumulative selection lets the
+      // artist see the combined coverage of their chosen pencil set.
+      let inBand = false;
+      for (let r = 0; r < highlightRanges.length; r++) {
+        const range = highlightRanges[r];
+        if (avg >= range[0] && avg <= range[1]) {
+          inBand = true;
+          break;
+        }
+      }
+      if (inBand) {
         data[i] = 0;
         data[i + 1] = 255;
         data[i + 2] = 255;

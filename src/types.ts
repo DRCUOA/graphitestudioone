@@ -18,7 +18,15 @@ export interface AssistantSettings {
   grayscale: boolean;
   posterize: boolean;
   posterizeLevels: number;
-  highlightGrade: PencilGrade | 'NONE';
+  /**
+   * Active pencil-grade highlights. Each grade tags the luminance bin
+   * mapped to that pencil's hardness; pixels falling in *any* selected
+   * bin are tinted, the rest dimmed. The set is cumulative — clicking
+   * a grade toggles it in/out, the OFF button clears the entire set.
+   *
+   * Empty array = no highlight (formerly modelled as `'NONE'`).
+   */
+  highlightGrades: PencilGrade[];
   contrast: number;
   brightness: number;
   edges: boolean;
@@ -179,3 +187,161 @@ export interface LineState {
  * Esc / clicking "Stop" returns to `idle`.
  */
 export type LineMode = 'idle' | 'placingA' | 'placingB';
+
+/* -------------------------------------------------------------------------- */
+/* Free-line Shapes (freehand pointer-drag sketches)                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A single freehand stroke. Stored as an ordered list of points sampled
+ * during the user's drag. Points are in image-pixel space so they zoom
+ * cleanly with the rest of the overlay layers.
+ *
+ * `points` must contain at least two entries by the time the stroke is
+ * committed — single-point "taps" are discarded by the overlay.
+ */
+export interface FreeLine {
+  id: string;
+  points: CalibrationPoint[];
+  /**
+   * Per-sample pressure values in [0, 1], parallel to `points` (always the
+   * same length). Drives the variable-width fill on render — higher values
+   * mean wider/darker, mimicking how a softer pencil deposits more graphite
+   * with firmer pressure.
+   *
+   * Captured from `PointerEvent.pressure` on tablets/styluses. For mouse
+   * and touch (which don't report meaningful pressure) we synthesise a
+   * pressure curve from pointer velocity: slower = harder press, the same
+   * physical relationship that holds on paper.
+   */
+  pressures: number[];
+  /** Stroke-width multiplier baked-in at draw time (1 = panel default). */
+  widthScale: number;
+  /** Hex colour the stroke was drawn with. */
+  color: string;
+  createdAt: number;
+}
+
+export interface FreeLineState {
+  strokes: FreeLine[];
+  /** Master visibility toggle. */
+  visible: boolean;
+  /** Render only the most-recent N strokes (full history is retained). */
+  showLastN: number;
+  /** Default stroke width (image-pixel units, scaled into screen-px on render). */
+  strokeWidth: number;
+  /** Default stroke colour for new strokes. */
+  color: string;
+  /**
+   * When true, modulate stroke width/opacity by per-sample pressure (real
+   * for pen pointers, velocity-simulated for mouse/touch). When false,
+   * every sample is treated as a constant 0.5 pressure for a flat line.
+   */
+  pressureEnabled: boolean;
+  /**
+   * Eraser brush radius in image-pixel units. Strokes whose geometry
+   * passes within this distance of the eraser cursor are removed.
+   */
+  eraserSize: number;
+}
+
+/**
+ * Free-line tool has three exclusive modes:
+ *  - `idle`    : pointer events ignored
+ *  - `drawing` : sampling points + pressure into an in-flight stroke
+ *  - `erasing` : dragging the eraser brush — strokes the cursor crosses
+ *                are removed live
+ */
+export type FreeLineMode = 'idle' | 'drawing' | 'erasing';
+
+/* -------------------------------------------------------------------------- */
+/* Trace Assist (edge-snap drawing aid)                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Per-project preferences for the edge-snap tracing aid. The detected
+ * edge map itself is recomputed from the source image on demand and
+ * therefore lives in transient app state — only these settings persist
+ * with the project.
+ */
+export interface TraceAssist {
+  /** Master switch — when false, snapping is suppressed everywhere. */
+  enabled: boolean;
+  /**
+   * Snap aggressiveness multiplier in [0.25, 2.5]. Larger values widen
+   * the search radius and lower the gradient threshold so the cursor
+   * snaps to weaker edges from further away.
+   */
+  sensitivity: number;
+  /** Render the detected edges as a faint white overlay on the image. */
+  showEdges: boolean;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Projects — application persistence layer                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The complete, serialisable working state of a single drawing project.
+ *
+ * This is the on-disk shape that gets round-tripped through both the
+ * in-tab session-storage autosave AND the IndexedDB persistence layer.
+ *
+ * NB: image fields are kept as data URLs (strings) rather than Blobs so
+ * the same payload can be persisted to either backing store without
+ * conversion. Blob storage would be more compact but would also require
+ * a more elaborate marshalling layer for sessionStorage.
+ */
+export interface ProjectData {
+  /** Current (post-crop) reference image, base64 data URL. */
+  image: string | null;
+  /** Pre-crop reference. Kept so "Reset crop" still works after reload. */
+  originalImage: string | null;
+  /** Optional drawing-in-progress overlay photo. */
+  overlayImage: string | null;
+
+  layers: LayerConfig[];
+  grid: GridConfig;
+  assistant: AssistantSettings;
+  spotlight: SpotlightConfig;
+  overlayFit: OverlayFit;
+
+  calibration: CalibrationState;
+  measurement: MeasurementState;
+  lineState: LineState;
+  freeLineState: FreeLineState;
+  traceAssist: TraceAssist;
+}
+
+/**
+ * Lightweight metadata used by the project picker UI. Excludes the heavy
+ * `data` field so the picker can render quickly even with many projects.
+ */
+export interface ProjectMeta {
+  id: string;
+  name: string;
+  /** Epoch ms — first time the project was created. */
+  createdAt: number;
+  /** Epoch ms — last time any field was persisted to IDB. */
+  updatedAt: number;
+  /** Small JPEG data URL (≤ ~256px on the long edge) for the picker tile. */
+  thumbnail: string | null;
+}
+
+/** A full Project record: metadata + the heavy ProjectData payload. */
+export interface Project extends ProjectMeta {
+  data: ProjectData;
+}
+
+/**
+ * Shape of the in-tab session-storage autosave entry. The `projectId`
+ * pins the draft to a specific persisted project so we don't accidentally
+ * overwrite a different project on flush.
+ */
+export interface SessionDraft {
+  projectId: string;
+  projectName: string;
+  data: ProjectData;
+  /** Epoch ms — last write. Used to detect stale drafts on restore. */
+  updatedAt: number;
+}

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Upload, Grid3X3, Settings2, Sliders, RotateCcw, ZoomIn, ZoomOut, Maximize2, Download, Eye, EyeOff, Camera, Box, Search, Crop, Layers, X, Sun, Moon, Ruler, Lock } from 'lucide-react';
+import { Upload, Grid3X3, Settings2, Sliders, RotateCcw, ZoomIn, ZoomOut, Maximize2, Download, Eye, EyeOff, Camera, Box, Search, Crop, Layers, X, Sun, Moon, Ruler, Lock, FolderOpen, Save, Pencil } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   PencilGrade,
@@ -20,6 +20,11 @@ import {
   MeasurementState,
   LineMode,
   LineState,
+  FreeLineMode,
+  FreeLineState,
+  TraceAssist,
+  ProjectData,
+  ProjectMeta,
 } from './types';
 import { PENCIL_GRADES, applyAssistantFilters } from './lib/drawingUtils';
 import {
@@ -30,11 +35,9 @@ import {
   formatMeasurement,
   formatScaleRatio,
   getActiveCalibration,
-  loadCalibrationState,
   PAPER_SIZES,
   PaperSizeKey,
   pxToUnits,
-  saveCalibrationState,
 } from './lib/calibration';
 import { CalibrationOverlay } from './components/CalibrationOverlay';
 import { CalibrationModal } from './components/CalibrationModal';
@@ -46,20 +49,48 @@ import { MeasurementPanel } from './components/MeasurementPanel';
 import {
   createMeasurement,
   emptyMeasurementState,
-  loadMeasurementState,
-  saveMeasurementState,
 } from './lib/measurement';
 import { LineOverlay } from './components/LineOverlay';
 import { LinePanel } from './components/LinePanel';
 import {
   createLine,
   emptyLineState,
-  loadLineState,
-  saveLineState,
   visibleLines,
 } from './lib/lines';
+import { FreeLineOverlay } from './components/FreeLineOverlay';
+import { FreeLinePanel } from './components/FreeLinePanel';
+import {
+  createFreeLine,
+  emptyFreeLineState,
+  visibleFreeLines,
+} from './lib/freeLines';
+import { TraceAssistPanel, type TraceAssistStatus } from './components/TraceAssistPanel';
+import { EdgePreviewOverlay } from './components/EdgePreviewOverlay';
+import {
+  emptyTraceAssist,
+  snapParamsFor,
+  snapToEdge,
+  type EdgeMap,
+} from './lib/edges';
+import EdgesWorker from './lib/edgesWorker?worker';
 import { ExportModal } from './components/ExportModal';
 import { buildExportLayerMetas } from './lib/export';
+import { ProjectPicker } from './components/ProjectPicker';
+import {
+  createProject,
+  deleteProject as deleteStoredProject,
+  listProjects,
+  loadHTMLImage,
+  loadProject,
+  renameProject as renameStoredProject,
+  saveProject as saveStoredProject,
+} from './lib/projects';
+import {
+  clearSessionDraft,
+  loadSessionDraft,
+  saveSessionDraft,
+} from './lib/projectSession';
+import { createEmptyProjectData } from './lib/db';
 
 export default function App() {
   const [image, setImage] = useState<string | null>(null);
@@ -85,7 +116,7 @@ export default function App() {
     grayscale: true,
     posterize: false,
     posterizeLevels: 5,
-    highlightGrade: 'NONE',
+    highlightGrades: [],
     contrast: 0,
     brightness: 0,
     edges: false,
@@ -142,12 +173,46 @@ export default function App() {
   }, [theme]);
 
   /* ---------------------------------------------------------------------- */
+  /* Project lifecycle                                                      */
+  /*                                                                        */
+  /* The app is project-scoped: every editing session is anchored to a      */
+  /* persisted Project record. While editing, all state mutations are       */
+  /* mirrored into sessionStorage on a short debounce (autosave). On exit   */
+  /* (or explicit save / project switch) the latest draft is flushed to     */
+  /* IndexedDB and the session draft is wiped.                              */
+  /* ---------------------------------------------------------------------- */
+
+  /** Top-level UI phase. Drives whether we render the editor or the picker. */
+  const [appPhase, setAppPhase] = useState<'loading' | 'picker' | 'editing'>('loading');
+  const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
+  const [currentProjectName, setCurrentProjectName] = useState<string>('');
+  const [currentProjectCreatedAt, setCurrentProjectCreatedAt] = useState<number>(0);
+  const [projectList, setProjectList] = useState<ProjectMeta[]>([]);
+  /** Picker reachable from the header even while editing — used for switch. */
+  const [pickerOpen, setPickerOpen] = useState(false);
+  /** Header-level "saved/unsaved" hint based on whether a session draft exists. */
+  const [persistedAt, setPersistedAt] = useState<number>(0);
+  /** Inline rename UI state for the project-name pill in the toolbar. */
+  const [renaming, setRenaming] = useState(false);
+  const [renameInput, setRenameInput] = useState('');
+
+  // Refs let the exit handlers read the latest project identity without
+  // needing to re-attach the listeners every time those primitives change.
+  const currentProjectIdRef = useRef<string | null>(null);
+  const currentProjectNameRef = useRef<string>('');
+  const currentProjectCreatedAtRef = useRef<number>(0);
+  useEffect(() => { currentProjectIdRef.current = currentProjectId; }, [currentProjectId]);
+  useEffect(() => { currentProjectNameRef.current = currentProjectName; }, [currentProjectName]);
+  useEffect(() => { currentProjectCreatedAtRef.current = currentProjectCreatedAt; }, [currentProjectCreatedAt]);
+
+  /* ---------------------------------------------------------------------- */
   /* Scale calibration                                                      */
   /* ---------------------------------------------------------------------- */
-  // Project-level calibration state. Lazily hydrated from localStorage so a
-  // page reload keeps the user's calibrated scale.
+  // Project-level calibration state. Hydrated from the active project on
+  // open (see `applyProjectData`); starts empty so SSR/initial render is
+  // deterministic.
   const [calibration, setCalibration] = useState<CalibrationState>(() =>
-    loadCalibrationState(),
+    emptyCalibrationState(),
   );
   // Lightweight undo/redo history. We snapshot the whole calibration state
   // on every committed change which is plenty cheap given the data size.
@@ -159,10 +224,9 @@ export default function App() {
   const [draftB, setDraftB] = useState<CalibrationPoint | null>(null);
   const [calHover, setCalHover] = useState<CalibrationPoint | null>(null);
 
-  // Persist whenever calibration state changes.
-  useEffect(() => {
-    saveCalibrationState(calibration);
-  }, [calibration]);
+  // Calibration persistence is now handled by the project-level autosave
+  // (see the session/IDB lifecycle effects below), so no per-slice write
+  // effect is needed here.
 
   /**
    * Wrap any "committable" calibration mutation. Pushes the previous state
@@ -254,6 +318,9 @@ export default function App() {
     // Cancel competing modes/tools that would steal pointer events.
     setCropMode(false);
     setSpotlight((s) => ({ ...s, enabled: false }));
+    setMeasMode('idle');
+    setLineMode('idle');
+    setFreeLineMode('idle');
   };
 
   const cancelCalibration = () => {
@@ -397,7 +464,7 @@ export default function App() {
   /* Custom measurements (named markers, e.g. "Left pupil → right nipple")  */
   /* ---------------------------------------------------------------------- */
   const [measurement, setMeasurement] = useState<MeasurementState>(() =>
-    loadMeasurementState(),
+    emptyMeasurementState(),
   );
   const [measMode, setMeasMode] = useState<MeasurementMode>('idle');
   const [measDraftA, setMeasDraftA] = useState<CalibrationPoint | null>(null);
@@ -409,9 +476,7 @@ export default function App() {
   const [measFuture, setMeasFuture] = useState<MeasurementState[]>([]);
   const measDragSnapshotRef = useRef<MeasurementState | null>(null);
 
-  useEffect(() => {
-    saveMeasurementState(measurement);
-  }, [measurement]);
+  // Measurement persistence is handled by the project-level autosave.
 
   const commitMeasurement = useCallback(
     (updater: (prev: MeasurementState) => MeasurementState) => {
@@ -471,6 +536,8 @@ export default function App() {
     setCropMode(false);
     setSpotlight((s) => ({ ...s, enabled: false }));
     setCalMode('idle');
+    setLineMode('idle');
+    setFreeLineMode('idle');
   };
 
   const cancelMeasurement = () => {
@@ -594,14 +661,12 @@ export default function App() {
   /* ---------------------------------------------------------------------- */
   /* Line Shapes — quick two-click freehand lines (no measurements)         */
   /* ---------------------------------------------------------------------- */
-  const [lineState, setLineState] = useState<LineState>(() => loadLineState());
+  const [lineState, setLineState] = useState<LineState>(() => emptyLineState());
   const [lineMode, setLineMode] = useState<LineMode>('idle');
   const [lineDraftA, setLineDraftA] = useState<CalibrationPoint | null>(null);
   const [lineHover, setLineHover] = useState<CalibrationPoint | null>(null);
 
-  useEffect(() => {
-    saveLineState(lineState);
-  }, [lineState]);
+  // Line-state persistence is handled by the project-level autosave.
 
   // Esc cancels in-flight line drawing.
   useEffect(() => {
@@ -627,6 +692,7 @@ export default function App() {
     setSpotlight((s) => ({ ...s, enabled: false }));
     setCalMode('idle');
     setMeasMode('idle');
+    setFreeLineMode('idle');
   };
 
   const stopLineDrawing = () => {
@@ -682,6 +748,594 @@ export default function App() {
   };
 
   const linesToRender = useMemo(() => visibleLines(lineState), [lineState]);
+
+  /* ---------------------------------------------------------------------- */
+  /* Free-line shapes — pointer-drag freehand sketches                      */
+  /* ---------------------------------------------------------------------- */
+  const [freeLineState, setFreeLineState] = useState<FreeLineState>(() =>
+    emptyFreeLineState(),
+  );
+  const [freeLineMode, setFreeLineMode] = useState<FreeLineMode>('idle');
+
+  // Esc cancels the free-draw mode.
+  useEffect(() => {
+    if (freeLineMode === 'idle') return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setFreeLineMode('idle');
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [freeLineMode]);
+
+  const standDownOtherToolsForFree = () => {
+    // Stand down competing tools so pointer events reach the free-draw layer.
+    setCropMode(false);
+    setSpotlight((s) => ({ ...s, enabled: false }));
+    setCalMode('idle');
+    setMeasMode('idle');
+    setLineMode('idle');
+  };
+
+  const startFreeDrawing = () => {
+    if (!imageElement) return;
+    setFreeLineMode('drawing');
+    standDownOtherToolsForFree();
+  };
+
+  const startFreeErasing = () => {
+    if (!imageElement) return;
+    setFreeLineMode('erasing');
+    standDownOtherToolsForFree();
+  };
+
+  const stopFreeDrawing = () => setFreeLineMode('idle');
+
+  const handleFreeStrokeCommit = useCallback(
+    (points: CalibrationPoint[], pressures: number[]) => {
+      const stroke = createFreeLine({
+        points,
+        pressures,
+        widthScale: freeLineState.strokeWidth,
+        color: freeLineState.color,
+      });
+      setFreeLineState((prev) => ({
+        ...prev,
+        strokes: [...prev.strokes, stroke],
+      }));
+    },
+    [freeLineState.strokeWidth, freeLineState.color],
+  );
+
+  /**
+   * Eraser callback: filters out every stroke whose id is in `ids`. The
+   * overlay calls this on every pointer-move sample that intersects one
+   * or more strokes, so the user sees marks vanish under the brush in
+   * real time. Bailing out early when nothing changed avoids needless
+   * re-renders for strokes that were already removed by an earlier
+   * sample in the same drag.
+   */
+  const handleFreeEraseStrokes = useCallback((ids: string[]) => {
+    if (ids.length === 0) return;
+    const idSet = new Set(ids);
+    setFreeLineState((prev) => {
+      const next = prev.strokes.filter((s) => !idSet.has(s.id));
+      if (next.length === prev.strokes.length) return prev;
+      return { ...prev, strokes: next };
+    });
+  }, []);
+
+  const handleToggleFreeVisible = () => {
+    setFreeLineState((prev) => ({ ...prev, visible: !prev.visible }));
+  };
+
+  const handleChangeFreeShowN = (n: number) => {
+    setFreeLineState((prev) => ({ ...prev, showLastN: n }));
+  };
+
+  const handleChangeFreeWidth = (w: number) => {
+    setFreeLineState((prev) => ({ ...prev, strokeWidth: w }));
+  };
+
+  const handleChangeFreeColor = (hex: string) => {
+    setFreeLineState((prev) => ({ ...prev, color: hex }));
+  };
+
+  const handleToggleFreePressure = () => {
+    setFreeLineState((prev) => ({ ...prev, pressureEnabled: !prev.pressureEnabled }));
+  };
+
+  const handleChangeFreeEraserSize = (n: number) => {
+    setFreeLineState((prev) => ({ ...prev, eraserSize: n }));
+  };
+
+  const handleUndoLastFreeStroke = () => {
+    setFreeLineState((prev) =>
+      prev.strokes.length === 0
+        ? prev
+        : { ...prev, strokes: prev.strokes.slice(0, -1) },
+    );
+  };
+
+  const handleClearAllFreeStrokes = () => {
+    setFreeLineState((prev) =>
+      prev.strokes.length === 0 ? prev : { ...prev, strokes: [] },
+    );
+  };
+
+  const freeStrokesToRender = useMemo(
+    () => visibleFreeLines(freeLineState),
+    [freeLineState],
+  );
+
+  /* ---------------------------------------------------------------------- */
+  /* Trace Assist — edge-snap drawing aid                                   */
+  /*                                                                        */
+  /* Architecture:                                                          */
+  /*   • settings (enabled, sensitivity, showEdges) live inside ProjectData */
+  /*     so each project remembers the user's preference                    */
+  /*   • the edge map itself is derived from the source image and lives in  */
+  /*     transient state — recomputed when the image changes                */
+  /*   • Sobel runs in a Web Worker so big photos don't freeze the UI       */
+  /*   • a memoised `snapPoint` callback is shared by every drawing overlay */
+  /*     so snap behaviour is consistent across Free Draw, Line and        */
+  /*     Measurement                                                       */
+  /* ---------------------------------------------------------------------- */
+
+  const [traceAssist, setTraceAssist] = useState<TraceAssist>(() => emptyTraceAssist());
+  const [edgeMap, setEdgeMap] = useState<EdgeMap | null>(null);
+  const [edgeStatus, setEdgeStatus] = useState<TraceAssistStatus>('no-image');
+  // Track Shift via a ref so the snap callback isn't rebuilt on every key
+  // event (which would cascade through every overlay's deps).
+  const shiftHeldRef = useRef(false);
+  // Track in-flight workers so a new image upload mid-compute supersedes
+  // the prior request without leaking a worker.
+  const workerRef = useRef<Worker | null>(null);
+  const computeTokenRef = useRef(0);
+
+  useEffect(() => {
+    const onDown = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') shiftHeldRef.current = true;
+    };
+    const onUp = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') shiftHeldRef.current = false;
+    };
+    window.addEventListener('keydown', onDown);
+    window.addEventListener('keyup', onUp);
+    return () => {
+      window.removeEventListener('keydown', onDown);
+      window.removeEventListener('keyup', onUp);
+    };
+  }, []);
+
+  // Decode the active image into an ImageData buffer and ship to the
+  // worker. Returns nothing — results arrive async via worker.onmessage.
+  const triggerEdgeCompute = useCallback((image: HTMLImageElement | null) => {
+    // Cancel any prior request — `computeTokenRef` is checked in the
+    // reply handler so stale results from a superseded image don't
+    // overwrite the current edge map.
+    computeTokenRef.current += 1;
+    const token = computeTokenRef.current;
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
+    }
+
+    if (!image) {
+      setEdgeMap(null);
+      setEdgeStatus('no-image');
+      return;
+    }
+
+    setEdgeStatus('computing');
+
+    let canvas: HTMLCanvasElement | null = null;
+    try {
+      canvas = document.createElement('canvas');
+      canvas.width = image.naturalWidth || image.width;
+      canvas.height = image.naturalHeight || image.height;
+      const ctx = canvas.getContext('2d', { willReadFrequently: false });
+      if (!ctx) throw new Error('No 2D context');
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+      const worker = new EdgesWorker();
+      workerRef.current = worker;
+      worker.onmessage = (e: MessageEvent<{ ok: boolean; map?: EdgeMap; error?: string }>) => {
+        if (computeTokenRef.current !== token) return; // superseded
+        worker.terminate();
+        if (workerRef.current === worker) workerRef.current = null;
+        if (e.data.ok && e.data.map) {
+          setEdgeMap(e.data.map);
+          setEdgeStatus('ready');
+        } else {
+          setEdgeMap(null);
+          setEdgeStatus('failed');
+          if (e.data.error) console.warn('Edge worker:', e.data.error);
+        }
+      };
+      worker.onerror = (err) => {
+        if (computeTokenRef.current !== token) return;
+        worker.terminate();
+        if (workerRef.current === worker) workerRef.current = null;
+        setEdgeMap(null);
+        setEdgeStatus('failed');
+        console.warn('Edge worker error:', err);
+      };
+      worker.postMessage(
+        { width: canvas.width, height: canvas.height, data: imageData.data },
+        [imageData.data.buffer],
+      );
+    } catch (err) {
+      console.warn('Edge compute setup failed:', err);
+      setEdgeMap(null);
+      setEdgeStatus('failed');
+    }
+  }, []);
+
+  // Recompute whenever the active image changes — including project
+  // switches, fresh uploads, and re-uploads of the same file.
+  useEffect(() => {
+    triggerEdgeCompute(imageElement);
+  }, [imageElement, triggerEdgeCompute]);
+
+  // Cleanup on unmount.
+  useEffect(() => {
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Shared snap callback for every overlay. Stable reference for as long
+  // as the underlying edge map / settings don't change — overlays can
+  // safely list it in their effect deps without thrashing.
+  const snapPoint = useCallback(
+    (x: number, y: number): { x: number; y: number } | null => {
+      if (shiftHeldRef.current) return null;
+      if (!traceAssist.enabled || !edgeMap) return null;
+      const { radius, threshold } = snapParamsFor(traceAssist.sensitivity);
+      const hit = snapToEdge(edgeMap, x, y, radius, threshold);
+      return hit ? { x: hit.x, y: hit.y } : null;
+    },
+    [edgeMap, traceAssist.enabled, traceAssist.sensitivity],
+  );
+
+  const handleToggleTraceEnabled = () => {
+    setTraceAssist((prev) => ({ ...prev, enabled: !prev.enabled }));
+  };
+  const handleChangeTraceSensitivity = (s: number) => {
+    setTraceAssist((prev) => ({ ...prev, sensitivity: s }));
+  };
+  const handleToggleTraceShowEdges = () => {
+    setTraceAssist((prev) => ({ ...prev, showEdges: !prev.showEdges }));
+  };
+  const handleRecomputeEdges = () => {
+    triggerEdgeCompute(imageElement);
+  };
+
+  /* ---------------------------------------------------------------------- */
+  /* Project lifecycle helpers                                              */
+  /*                                                                        */
+  /* These come AFTER all the per-slice state declarations so the helpers   */
+  /* below can read/write every relevant setter directly. They're declared  */
+  /* with useCallback so the effects that reference them can list them in   */
+  /* their deps without re-firing every render.                             */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Hydrate every persisted slice of state from a ProjectData snapshot.
+   * Async because image fields (data URLs) need to be decoded into
+   * HTMLImageElement instances for the canvas to consume.
+   *
+   * Also resets all transient editing state (undo stacks, in-flight
+   * placement modes, zoom, crop) so the user lands in a clean editing
+   * session that doesn't inherit anything from the previous project.
+   */
+  const applyProjectData = useCallback(async (data: ProjectData): Promise<void> => {
+    setLayers(data.layers);
+    setGrid(data.grid);
+    setAssistant(data.assistant);
+    setSpotlight(data.spotlight);
+    setOverlayFit(data.overlayFit);
+    setCalibration(data.calibration);
+    setMeasurement(data.measurement);
+    setLineState(data.lineState);
+    setFreeLineState(data.freeLineState);
+    setTraceAssist(data.traceAssist);
+
+    // Reset transient state so a project switch doesn't inherit ghost UI.
+    setCalPast([]); setCalFuture([]);
+    setCalMode('idle'); setDraftA(null); setDraftB(null); setCalHover(null);
+    setMeasPast([]); setMeasFuture([]);
+    setMeasMode('idle'); setMeasDraftA(null); setMeasDraftB(null); setMeasHover(null);
+    setLineMode('idle'); setLineDraftA(null); setLineHover(null);
+    setFreeLineMode('idle');
+    setZoom(1); setCropMode(false);
+
+    // Hydrate images sequentially. We swallow decode errors so a single
+    // corrupt data URL doesn't strand the user — the project simply
+    // re-opens with the broken image cleared.
+    if (data.image) {
+      try {
+        const img = await loadHTMLImage(data.image);
+        setImage(data.image);
+        setImageElement(img);
+      } catch {
+        setImage(null); setImageElement(null);
+      }
+    } else {
+      setImage(null); setImageElement(null);
+    }
+    if (data.originalImage) {
+      try {
+        const img = await loadHTMLImage(data.originalImage);
+        setOriginalImage(data.originalImage);
+        setOriginalImageElement(img);
+      } catch {
+        setOriginalImage(null); setOriginalImageElement(null);
+      }
+    } else {
+      setOriginalImage(null); setOriginalImageElement(null);
+    }
+    if (data.overlayImage) {
+      try {
+        const img = await loadHTMLImage(data.overlayImage);
+        setOverlayImage(data.overlayImage);
+        setOverlayImageElement(img);
+      } catch {
+        setOverlayImage(null); setOverlayImageElement(null);
+      }
+    } else {
+      setOverlayImage(null); setOverlayImageElement(null);
+    }
+  }, []);
+
+  /**
+   * Snapshot the full editing state into a serialisable ProjectData record
+   * suitable for either sessionStorage autosave or IDB persistence. Pure
+   * function of current state — never reads from refs or DOM nodes.
+   */
+  const collectProjectData = useCallback((): ProjectData => ({
+    image,
+    originalImage,
+    overlayImage,
+    layers,
+    grid,
+    assistant,
+    spotlight,
+    overlayFit,
+    calibration,
+    measurement,
+    lineState,
+    freeLineState,
+    traceAssist,
+  }), [
+    image, originalImage, overlayImage,
+    layers, grid, assistant, spotlight, overlayFit,
+    calibration, measurement, lineState, freeLineState, traceAssist,
+  ]);
+
+  /**
+   * Force-flush the current sessionStorage draft to IndexedDB. Optionally
+   * clears the session draft afterwards (e.g. on tab close or explicit
+   * "close project"). Best-effort: any IDB error is logged but never
+   * surfaces because callers are typically in unload-time code paths
+   * where there's no UI to react to.
+   */
+  const flushDraftToDb = useCallback(async (clearSession: boolean): Promise<void> => {
+    const projectId = currentProjectIdRef.current;
+    if (!projectId) return;
+    const draft = loadSessionDraft();
+    if (draft && draft.projectId === projectId) {
+      try {
+        const meta = await saveStoredProject({
+          id: projectId,
+          name: currentProjectNameRef.current,
+          createdAt: currentProjectCreatedAtRef.current,
+          data: draft.data,
+        });
+        // Refresh metadata in the picker list (newest-first ordering).
+        setProjectList((prev) => [meta, ...prev.filter((p) => p.id !== meta.id)]);
+        setPersistedAt(meta.updatedAt);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[project] flush to IndexedDB failed:', err);
+      }
+    }
+    if (clearSession) clearSessionDraft();
+  }, []);
+
+  /* ---------------------------------------------------------------------- */
+  /* Startup: try to restore the in-tab session, otherwise show the picker. */
+  /* ---------------------------------------------------------------------- */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await listProjects();
+        if (cancelled) return;
+        setProjectList(list);
+
+        const draft = loadSessionDraft();
+        const draftMeta = draft ? list.find((p) => p.id === draft.projectId) : null;
+        if (draft && draftMeta) {
+          await applyProjectData(draft.data);
+          if (cancelled) return;
+          setCurrentProjectId(draft.projectId);
+          setCurrentProjectName(draft.projectName);
+          setCurrentProjectCreatedAt(draftMeta.createdAt);
+          setPersistedAt(draftMeta.updatedAt);
+          setAppPhase('editing');
+        } else {
+          // Stale draft pointing at a deleted project — clean it up so the
+          // next refresh doesn't try to restore it again.
+          if (draft) clearSessionDraft();
+          setAppPhase('picker');
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[project] startup failed:', err);
+        setAppPhase('picker');
+      }
+    })();
+    return () => { cancelled = true; };
+    // Intentionally no deps — runs once on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* ---------------------------------------------------------------------- */
+  /* Autosave to sessionStorage on every state change (debounced).          */
+  /*                                                                        */
+  /* sessionStorage is the *primary* in-tab store while editing — it's      */
+  /* cheap, synchronous, and tab-scoped. The IDB layer takes over on exit.  */
+  /* ---------------------------------------------------------------------- */
+  useEffect(() => {
+    if (appPhase !== 'editing' || !currentProjectId) return;
+    const timer = setTimeout(() => {
+      saveSessionDraft({
+        projectId: currentProjectId,
+        projectName: currentProjectName,
+        data: collectProjectData(),
+        updatedAt: Date.now(),
+      });
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [appPhase, currentProjectId, currentProjectName, collectProjectData]);
+
+  /* ---------------------------------------------------------------------- */
+  /* Heartbeat: periodically flush session → IDB so a crash loses ≤30 s.    */
+  /* ---------------------------------------------------------------------- */
+  useEffect(() => {
+    if (appPhase !== 'editing' || !currentProjectId) return;
+    const id = window.setInterval(() => { void flushDraftToDb(false); }, 30_000);
+    return () => window.clearInterval(id);
+  }, [appPhase, currentProjectId, flushDraftToDb]);
+
+  /* ---------------------------------------------------------------------- */
+  /* Exit handlers: pagehide/beforeunload + visibility checkpoint.          */
+  /*                                                                        */
+  /*  • pagehide       → flush + clear session (the user is leaving)        */
+  /*  • beforeunload   → same; broadest browser coverage                    */
+  /*  • visibility:hidden → flush only (tab backgrounded ≠ exit)            */
+  /* ---------------------------------------------------------------------- */
+  useEffect(() => {
+    if (appPhase !== 'editing') return;
+    const onLeave = () => { void flushDraftToDb(true); };
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') void flushDraftToDb(false);
+    };
+    window.addEventListener('pagehide', onLeave);
+    window.addEventListener('beforeunload', onLeave);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('pagehide', onLeave);
+      window.removeEventListener('beforeunload', onLeave);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [appPhase, flushDraftToDb]);
+
+  /* ---------------------------------------------------------------------- */
+  /* User-facing project actions                                            */
+  /* ---------------------------------------------------------------------- */
+
+  /** Open a stored project. Flushes any current draft first to be safe. */
+  const handleOpenProject = useCallback(async (id: string): Promise<void> => {
+    setAppPhase('loading');
+    if (currentProjectIdRef.current && currentProjectIdRef.current !== id) {
+      await flushDraftToDb(true);
+    }
+    const project = await loadProject(id);
+    if (!project) {
+      // Was deleted between list & open — refresh and bounce back to picker.
+      const list = await listProjects();
+      setProjectList(list);
+      setAppPhase('picker');
+      return;
+    }
+    await applyProjectData(project.data);
+    setCurrentProjectId(project.id);
+    setCurrentProjectName(project.name);
+    setCurrentProjectCreatedAt(project.createdAt);
+    setPersistedAt(project.updatedAt);
+    setPickerOpen(false);
+    setAppPhase('editing');
+  }, [applyProjectData, flushDraftToDb]);
+
+  /** Create + open a brand-new project. */
+  const handleCreateProject = useCallback(async (input: { name: string; initialImage: string | null }): Promise<void> => {
+    setAppPhase('loading');
+    if (currentProjectIdRef.current) await flushDraftToDb(true);
+    const project = await createProject({
+      name: input.name,
+      initialImage: input.initialImage,
+    });
+    await applyProjectData(project.data);
+    setCurrentProjectId(project.id);
+    setCurrentProjectName(project.name);
+    setCurrentProjectCreatedAt(project.createdAt);
+    setPersistedAt(project.updatedAt);
+    setProjectList((prev) => [
+      { id: project.id, name: project.name, createdAt: project.createdAt, updatedAt: project.updatedAt, thumbnail: project.thumbnail },
+      ...prev.filter((p) => p.id !== project.id),
+    ]);
+    setPickerOpen(false);
+    setAppPhase('editing');
+  }, [applyProjectData, flushDraftToDb]);
+
+  /** Delete a project. If it's the current one, return to the picker. */
+  const handleDeleteProject = useCallback(async (id: string): Promise<void> => {
+    await deleteStoredProject(id);
+    setProjectList((prev) => prev.filter((p) => p.id !== id));
+    if (id === currentProjectIdRef.current) {
+      clearSessionDraft();
+      setCurrentProjectId(null);
+      setCurrentProjectName('');
+      setCurrentProjectCreatedAt(0);
+      setPersistedAt(0);
+      await applyProjectData(createEmptyProjectData());
+      setPickerOpen(false);
+      setAppPhase('picker');
+    }
+  }, [applyProjectData]);
+
+  /** Open the picker for a switch — flush current first so nothing is lost. */
+  const handleSwitchProject = useCallback(async (): Promise<void> => {
+    await flushDraftToDb(false);
+    const list = await listProjects();
+    setProjectList(list);
+    setPickerOpen(true);
+  }, [flushDraftToDb]);
+
+  /** Manual save button — flush to IDB without leaving the project. */
+  const handleSaveNow = useCallback(async (): Promise<void> => {
+    await flushDraftToDb(false);
+  }, [flushDraftToDb]);
+
+  /** Commit a rename — updates IDB metadata + local state. */
+  const handleCommitRename = useCallback(async (): Promise<void> => {
+    if (!currentProjectId) {
+      setRenaming(false);
+      return;
+    }
+    const trimmed = renameInput.trim();
+    if (!trimmed || trimmed === currentProjectName) {
+      setRenaming(false);
+      return;
+    }
+    const meta = projectList.find((p) => p.id === currentProjectId) ?? {
+      id: currentProjectId,
+      name: currentProjectName,
+      createdAt: currentProjectCreatedAt,
+      updatedAt: persistedAt,
+      thumbnail: null,
+    };
+    const updated = await renameStoredProject(meta, trimmed);
+    setCurrentProjectName(updated.name);
+    setProjectList((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+    setRenaming(false);
+  }, [currentProjectId, currentProjectName, currentProjectCreatedAt, persistedAt, projectList, renameInput]);
 
   /* ---------------------------------------------------------------------- */
   /* Export modal                                                           */
@@ -780,6 +1434,8 @@ export default function App() {
           setLineMode('idle');
           setLineDraftA(null);
           setLineHover(null);
+          setFreeLineState(emptyFreeLineState());
+          setFreeLineMode('idle');
         };
         img.src = event.target?.result as string;
       };
@@ -873,7 +1529,7 @@ export default function App() {
             ...assistant,
             grayscale: false,
             posterize: false,
-            highlightGrade: 'NONE',
+            highlightGrades: [],
             edges: false,
             invert: false
           });
@@ -1426,6 +2082,36 @@ export default function App() {
             onClearAll={handleClearAllLines}
           />
 
+          {/* Trace Assist — edge detection + snap */}
+          <TraceAssistPanel
+            state={traceAssist}
+            status={edgeStatus}
+            hasEdgeMap={!!edgeMap}
+            imageLoaded={!!imageElement}
+            onToggleEnabled={handleToggleTraceEnabled}
+            onChangeSensitivity={handleChangeTraceSensitivity}
+            onToggleShowEdges={handleToggleTraceShowEdges}
+            onRecompute={handleRecomputeEdges}
+          />
+
+          {/* Freehand sketch strokes */}
+          <FreeLinePanel
+            state={freeLineState}
+            mode={freeLineMode}
+            imageLoaded={!!imageElement}
+            onStartDraw={startFreeDrawing}
+            onStartErase={startFreeErasing}
+            onStop={stopFreeDrawing}
+            onToggleVisible={handleToggleFreeVisible}
+            onChangeShowLastN={handleChangeFreeShowN}
+            onChangeStrokeWidth={handleChangeFreeWidth}
+            onChangeColor={handleChangeFreeColor}
+            onTogglePressure={handleToggleFreePressure}
+            onChangeEraserSize={handleChangeFreeEraserSize}
+            onUndoLast={handleUndoLastFreeStroke}
+            onClearAll={handleClearAllFreeStrokes}
+          />
+
           {/* Grid Controls */}
           <section className="space-y-4">
             <div className="flex items-center justify-between border-b border-zinc-800 pb-2">
@@ -1651,25 +2337,59 @@ export default function App() {
 
             <div className="grid grid-cols-4 gap-1">
               <button
-                onClick={() => setAssistant(prev => ({ ...prev, highlightGrade: 'NONE' }))}
-                className={`text-[9px] font-mono py-1 rounded border ${assistant.highlightGrade === 'NONE' ? 'bg-zinc-400 text-zinc-950 border-zinc-400' : 'bg-transparent border-zinc-800 text-zinc-500 hover:border-zinc-700'}`}
-                title="Turn off pencil grade highlighting."
+                // OFF clears every selected grade — explicit "deselect all"
+                // shortcut so users don't have to click each active grade
+                // off individually after a long planning session.
+                onClick={() => setAssistant(prev => ({ ...prev, highlightGrades: [] }))}
+                className={`text-[9px] font-mono py-1 rounded border ${assistant.highlightGrades.length === 0 ? 'bg-zinc-400 text-zinc-950 border-zinc-400' : 'bg-transparent border-zinc-800 text-zinc-500 hover:border-zinc-700'}`}
+                title={
+                  assistant.highlightGrades.length === 0
+                    ? 'No pencil grades selected.'
+                    : `Clear all ${assistant.highlightGrades.length} selected grade${assistant.highlightGrades.length === 1 ? '' : 's'}.`
+                }
               >
                 OFF
               </button>
-              {PENCIL_GRADES.map(grade => (
-                <button
-                  key={grade}
-                  onClick={() => setAssistant(prev => ({ ...prev, highlightGrade: grade }))}
-                  className={`text-[9px] font-mono py-1 rounded border transition-all ${assistant.highlightGrade === grade ? 'bg-cyan-500 text-black border-cyan-500 shadow-[0_0_10px_rgba(6,182,212,0.3)]' : 'bg-transparent border-zinc-800 text-zinc-500 hover:border-zinc-700'}`}
-                  title={`Highlight components of the image that should be rendered with ${grade} pencil hardness.`}
-                >
-                  {grade}
-                </button>
-              ))}
+              {PENCIL_GRADES.map(grade => {
+                const selected = assistant.highlightGrades.includes(grade);
+                return (
+                  <button
+                    key={grade}
+                    // Selection is cumulative: clicking an unselected grade
+                    // adds it, clicking an already-selected grade removes
+                    // it. The artist builds up a palette of grades that
+                    // covers the tonal regions they care about for this
+                    // drawing, then sees that combined coverage on the
+                    // analysis canvas.
+                    onClick={() => setAssistant(prev => ({
+                      ...prev,
+                      highlightGrades: prev.highlightGrades.includes(grade)
+                        ? prev.highlightGrades.filter((g) => g !== grade)
+                        : [...prev.highlightGrades, grade],
+                    }))}
+                    className={`text-[9px] font-mono py-1 rounded border transition-all ${selected ? 'bg-cyan-500 text-black border-cyan-500 shadow-[0_0_10px_rgba(6,182,212,0.3)]' : 'bg-transparent border-zinc-800 text-zinc-500 hover:border-zinc-700'}`}
+                    title={
+                      selected
+                        ? `Remove ${grade} from the highlight set.`
+                        : `Add ${grade} — pixels in this pencil's tonal range will glow cyan.`
+                    }
+                    aria-pressed={selected}
+                  >
+                    {grade}
+                  </button>
+                );
+              })}
             </div>
             <p className="text-[9px] text-zinc-600 leading-tight">
-              Highlight components of the image that should be rendered with specific pencil hardness.
+              Click multiple grades to build a palette — every pixel in any
+              selected tonal range glows. Click the same grade again to drop
+              it; OFF clears the whole selection.
+              {assistant.highlightGrades.length > 0 && (
+                <span className="text-cyan-500/80">
+                  {' '}
+                  ({assistant.highlightGrades.length} active)
+                </span>
+              )}
             </p>
           </section>
         </div>
@@ -1758,6 +2478,62 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2">
+            {/* Project pill — shows the active project name and exposes
+                rename + switch + manual-save actions. */}
+            {currentProjectId && (
+              <div className="flex items-center gap-1 mr-1 bg-zinc-900 border border-zinc-800 rounded-md p-0.5">
+                {renaming ? (
+                  <form
+                    onSubmit={(e) => { e.preventDefault(); void handleCommitRename(); }}
+                    className="flex items-center"
+                  >
+                    <input
+                      autoFocus
+                      type="text"
+                      value={renameInput}
+                      onChange={(e) => setRenameInput(e.target.value)}
+                      onBlur={() => void handleCommitRename()}
+                      onKeyDown={(e) => { if (e.key === 'Escape') setRenaming(false); }}
+                      className="bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs font-mono text-zinc-100 focus:outline-none focus:border-emerald-500 w-44"
+                      placeholder="Project name"
+                    />
+                  </form>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => { setRenameInput(currentProjectName); setRenaming(true); }}
+                    className="flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-mono text-zinc-300 hover:text-zinc-50 transition-colors max-w-[14rem] truncate"
+                    title={`Rename project — “${currentProjectName}”`}
+                  >
+                    <Pencil className="w-3 h-3 text-zinc-500" />
+                    <span className="truncate">{currentProjectName || 'Untitled'}</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void handleSaveNow()}
+                  className="p-1.5 hover:bg-zinc-800 rounded text-zinc-400 hover:text-zinc-50 transition-colors"
+                  title={
+                    persistedAt
+                      ? `Saved ${new Date(persistedAt).toLocaleTimeString()} — click to save now`
+                      : 'Save project to persistence layer'
+                  }
+                  aria-label="Save project"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleSwitchProject()}
+                  className="p-1.5 hover:bg-zinc-800 rounded text-zinc-400 hover:text-zinc-50 transition-colors"
+                  title="Open another project"
+                  aria-label="Switch project"
+                >
+                  <FolderOpen className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+
             <button
               onClick={() => setTheme(prev => (prev === 'dark' ? 'light' : 'dark'))}
               className="p-2 hover:bg-zinc-900 rounded-md border border-transparent hover:border-zinc-800 text-zinc-500 hover:text-zinc-300 transition-all"
@@ -1942,6 +2718,7 @@ export default function App() {
                     onHover={setMeasHover}
                     onMeasurementPointDrag={handleMeasurementPointDrag}
                     onMeasurementPointDragEnd={handleMeasurementPointDragEnd}
+                    snap={snapPoint}
                   />
                 )}
 
@@ -1954,8 +2731,42 @@ export default function App() {
                     mode={lineMode}
                     draftA={lineDraftA}
                     hoverPoint={lineHover}
+                    calibration={activeCalibration}
                     onCanvasClick={handleLineCanvasClick}
                     onHover={setLineHover}
+                    snap={snapPoint}
+                  />
+                )}
+
+                {/* Freehand pencil strokes — sketches captured via pointer drag. */}
+                {imageElement && (
+                  <FreeLineOverlay
+                    imageWidth={imageElement.width}
+                    imageHeight={imageElement.height}
+                    strokes={freeStrokesToRender}
+                    mode={freeLineMode}
+                    defaultStrokeWidth={freeLineState.strokeWidth}
+                    defaultColor={freeLineState.color}
+                    pressureEnabled={freeLineState.pressureEnabled}
+                    eraserSize={freeLineState.eraserSize}
+                    calibration={activeCalibration}
+                    snap={snapPoint}
+                    onCommitStroke={handleFreeStrokeCommit}
+                    onEraseStrokes={handleFreeEraseStrokes}
+                  />
+                )}
+
+                {/* Detected-edges preview — sits BELOW the drawing overlays so
+                    strokes always read on top, and ABOVE the reference image
+                    so the wireframe is visible against the photo. */}
+                {imageElement && edgeMap && traceAssist.showEdges && (
+                  // Threshold mirrors the active snap threshold so the
+                  // red dashes you see are exactly the pixels the snap
+                  // can lock onto — verifying snap is just "draw near
+                  // a red mark, watch the green snap-magnet appear".
+                  <EdgePreviewOverlay
+                    map={edgeMap}
+                    threshold={snapParamsFor(traceAssist.sensitivity).threshold}
                   />
                 )}
 
@@ -2054,6 +2865,33 @@ export default function App() {
         composeArgs={exportComposeArgs}
         onClose={() => setExportOpen(false)}
       />
+
+      {/* Project picker — blocking on first run / when no project is open,
+          dismissible when invoked mid-session via "switch project". */}
+      {(appPhase === 'picker' || pickerOpen) && (
+        <ProjectPicker
+          projects={projectList}
+          blocking={appPhase === 'picker'}
+          onOpenProject={(id) => void handleOpenProject(id)}
+          onCreateProject={(input) => void handleCreateProject(input)}
+          onDeleteProject={(id) => void handleDeleteProject(id)}
+          onClose={() => setPickerOpen(false)}
+        />
+      )}
+
+      {/* Loading veil — shown briefly while the IDB store is initialising
+          or while a project is being hydrated. Prevents the empty editor
+          from flashing on cold start. */}
+      {appPhase === 'loading' && (
+        <div className="fixed inset-0 z-[400] flex items-center justify-center bg-zinc-950/95 backdrop-blur-sm">
+          <div className="text-center space-y-3">
+            <div className="w-3 h-3 bg-zinc-300 rotate-45 mx-auto animate-pulse" />
+            <p className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest">
+              Loading workspace…
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Decorative watermark logo overlaid on the top-left of the viewport.
           Placed last in the DOM so it stacks above the sidebar/main UI.
